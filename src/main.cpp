@@ -114,6 +114,34 @@ int main(int argc, char** argv) {
     size_t naiveBytes = c1.bytes() + p1.bytes() + c2.bytes() + p2.bytes() + g.bytes() + out.bytes();
     size_t reuseBytes = std::max(bufA.bytes(), bufB.bytes()) + g.bytes() + out.bytes();
 
+    // ---------- 多次运行取最优与均值，单次测量抖动太大 ----------
+    const int REPS = 10;
+    std::vector<double> baseRuns, fusedRuns;
+    for (int rep = 0; rep < REPS; ++rep) {
+        Tensor m1, m2, m3, m4, mg, mo;
+        auto s0 = std::chrono::steady_clock::now();
+        conv2d(input, w1, b1, 1, 1, m1); reluInplace(m1); maxpool2x2(m1, m2);
+        conv2d(m2, w2, b2, 1, 1, m3); reluInplace(m3); maxpool2x2(m3, m4);
+        globalAvgPool(m4, mg); fullyConnected(mg, w3, b3, mo);
+        auto s1 = std::chrono::steady_clock::now();
+        baseRuns.push_back(ms(s0, s1));
+
+        auto s2 = std::chrono::steady_clock::now();
+        conv2dRelu(input, w1, b1, 1, 1, m1); maxpool2x2(m1, m2);
+        conv2dRelu(m2, w2, b2, 1, 1, m3); maxpool2x2(m3, m4);
+        globalAvgPool(m4, mg); fullyConnected(mg, w3, b3, mo);
+        auto s3 = std::chrono::steady_clock::now();
+        fusedRuns.push_back(ms(s2, s3));
+    }
+    auto stat = [](std::vector<double>& v, double& mn, double& avg) {
+        mn = 1e9; avg = 0;
+        for (double x : v) { mn = std::min(mn, x); avg += x; }
+        avg /= v.size();
+    };
+    double bmin, bavg, fmin, favg;
+    stat(baseRuns, bmin, bavg);
+    stat(fusedRuns, fmin, favg);
+
     float maxDiff = 0.f;
     for (size_t i = 0; i < baseOut.size(); ++i)
         maxDiff = std::max(maxDiff, std::fabs(baseOut[i] - out.data[i]));
@@ -124,8 +152,10 @@ int main(int argc, char** argv) {
     printf("MACs                    : %.2f M\n", flops / 2 / 1e6);
     printf("GFLOPS(基线)            : %.3f\n", flops / (totalBase * 1e6));
     printf("GFLOPS(优化)            : %.3f\n", flops / (totalFused * 1e6));
-    printf("耗时 基线/优化          : %.3f ms -> %.3f ms (%.1f%% 下降)\n",
-           totalBase, totalFused, (1 - totalFused / totalBase) * 100);
+    printf("单次 基线/优化          : %.3f ms -> %.3f ms\n", totalBase, totalFused);
+    printf("%d 次平均 基线/优化      : %.3f ms -> %.3f ms (%.1f%%)\n", REPS, bavg, favg,
+           (1 - favg / bavg) * 100);
+    printf("%d 次最优 基线/优化      : %.3f ms -> %.3f ms\n", REPS, bmin, fmin);
     printf("中间张量显存 朴素/复用  : %.1f KB -> %.1f KB\n", naiveBytes / 1024.0, reuseBytes / 1024.0);
 
     if (doDump) {
