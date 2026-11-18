@@ -1,4 +1,5 @@
 #include "ops.h"
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -29,7 +30,19 @@ static void dump(const char* path, const Tensor& t, const std::vector<int>& shap
 }
 
 int main(int argc, char** argv) {
-    const bool doDump = (argc > 1 && std::string(argv[1]) == "dump");
+    bool doDump = false;
+    int benchN = 10;
+    for (int i = 1; i < argc; ++i) {
+        std::string a = argv[i];
+        if (a == "dump") doDump = true;
+        else if (a == "--bench" && i + 1 < argc) benchN = std::max(1, atoi(argv[++i]));
+        else if (a == "--help" || a == "-h") {
+            printf("用法: micro_infer [dump] [--bench N]\n");
+            printf("  dump      导出 dump_*.bin 供 python 参考实现对拍\n");
+            printf("  --bench N 基准重复次数（默认 10），报告 min/中位/均值/max\n");
+            return 0;
+        }
+    }
     srand(42);  // 固定种子，保证 C++ 和 python 参考实现拿到同一组权重
 
     const int N = 8, IN = 64, IC = 3, OC1 = 16, OC2 = 32, CLS = 10;
@@ -115,8 +128,10 @@ int main(int argc, char** argv) {
     size_t reuseBytes = std::max(bufA.bytes(), bufB.bytes()) + g.bytes() + out.bytes();
 
     // ---------- 多次运行取最优与均值，单次测量抖动太大 ----------
-    const int REPS = 10;
+    // 基准次数可调：机器噪声大时多跑几次看中位数，比只看均值可靠
+    const int REPS = benchN;
     std::vector<double> baseRuns, fusedRuns;
+    baseRuns.reserve(REPS); fusedRuns.reserve(REPS);
     for (int rep = 0; rep < REPS; ++rep) {
         Tensor m1, m2, m3, m4, mg, mo;
         auto s0 = std::chrono::steady_clock::now();
@@ -133,14 +148,24 @@ int main(int argc, char** argv) {
         auto s3 = std::chrono::steady_clock::now();
         fusedRuns.push_back(ms(s2, s3));
     }
-    auto stat = [](std::vector<double>& v, double& mn, double& avg) {
-        mn = 1e9; avg = 0;
-        for (double x : v) { mn = std::min(mn, x); avg += x; }
-        avg /= v.size();
+    // 均值会被偶发的一次调度抖动拉偏，所以同时给中位数和最大值：
+    // min 代表"这台机器能跑多快"，median 代表"通常多快"，max 暴露抖动有多大
+    struct Stat { double mn, med, avg, mx; };
+    auto stat = [](std::vector<double>& v) {
+        Stat st{};
+        std::vector<double> s = v;
+        std::sort(s.begin(), s.end());
+        st.mn = s.front();
+        st.mx = s.back();
+        st.med = (s.size() % 2) ? s[s.size() / 2]
+                                : 0.5 * (s[s.size() / 2 - 1] + s[s.size() / 2]);
+        double sum = 0;
+        for (double x : s) sum += x;
+        st.avg = sum / s.size();
+        return st;
     };
-    double bmin, bavg, fmin, favg;
-    stat(baseRuns, bmin, bavg);
-    stat(fusedRuns, fmin, favg);
+    Stat bs = stat(baseRuns), fs = stat(fusedRuns);
+    const double bmin = bs.mn, bavg = bs.avg, fmin = fs.mn, favg = fs.avg;
 
     float maxDiff = 0.f;
     for (size_t i = 0; i < baseOut.size(); ++i)
@@ -156,6 +181,12 @@ int main(int argc, char** argv) {
     printf("%d 次平均 基线/优化      : %.3f ms -> %.3f ms (%.1f%%)\n", REPS, bavg, favg,
            (1 - favg / bavg) * 100);
     printf("%d 次最优 基线/优化      : %.3f ms -> %.3f ms\n", REPS, bmin, fmin);
+    // 只有"最优"这组数受系统噪声影响最小，拿它算 GFLOPS 才有可比性
+    printf("GFLOPS(最优)            : %.3f -> %.3f\n", flops / (bmin * 1e6), flops / (fmin * 1e6));
+    printf("%d 次中位 基线/优化      : %.3f ms -> %.3f ms (%.1f%%)\n", REPS, bs.med, fs.med,
+           (1 - fs.med / bs.med) * 100);
+    printf("%d 次最差 基线/优化      : %.3f ms -> %.3f ms  抖动 %.1f%% / %.1f%%\n", REPS, bs.mx, fs.mx,
+           (bs.mx / bs.mn - 1) * 100, (fs.mx / fs.mn - 1) * 100);
     printf("中间张量显存 朴素/复用  : %.1f KB -> %.1f KB\n", naiveBytes / 1024.0, reuseBytes / 1024.0);
 
     if (doDump) {
