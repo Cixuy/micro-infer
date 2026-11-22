@@ -1,0 +1,11 @@
+layer,output,ms
+conv1 3x3 s1 p1,65x65x16,6.501
+relu1,-,1.295
+maxpool 2x2,32x32,0.387
+conv2 3x3 s1 p1,33x33x32,10.505
+relu2,-,0.482
+maxpool 2x2,16x16,0.199
+global avgpool,32,0.052
+fc,10,0.002
+total,,19.543
+fused_total,,19.268

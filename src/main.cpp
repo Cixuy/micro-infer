@@ -32,14 +32,17 @@ static void dump(const char* path, const Tensor& t, const std::vector<int>& shap
 int main(int argc, char** argv) {
     bool doDump = false;
     int benchN = 10;
+    std::string csvPath;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         if (a == "dump") doDump = true;
         else if (a == "--bench" && i + 1 < argc) benchN = std::max(1, atoi(argv[++i]));
+        else if (a == "--csv" && i + 1 < argc) csvPath = argv[++i];
         else if (a == "--help" || a == "-h") {
             printf("用法: micro_infer [dump] [--bench N]\n");
             printf("  dump      导出 dump_*.bin 供 python 参考实现对拍\n");
             printf("  --bench N 基准重复次数（默认 10），报告 min/中位/均值/max\n");
+            printf("  --csv F   把逐层耗时写成 CSV，便于两次运行 diff 出性能回归\n");
             return 0;
         }
     }
@@ -188,6 +191,27 @@ int main(int argc, char** argv) {
     printf("%d 次最差 基线/优化      : %.3f ms -> %.3f ms  抖动 %.1f%% / %.1f%%\n", REPS, bs.mx, fs.mx,
            (bs.mx / bs.mn - 1) * 100, (fs.mx / fs.mn - 1) * 100);
     printf("中间张量显存 朴素/复用  : %.1f KB -> %.1f KB\n", naiveBytes / 1024.0, reuseBytes / 1024.0);
+
+    // 逐层耗时落 CSV：同一台机器前后跑两次 diff，就能看出哪一层变慢了。
+    // 控制台表格是给人看的，CSV 是给脚本比的 —— 性能回归靠肉眼看表格不可靠。
+    if (!csvPath.empty()) {
+        FILE* f = fopen(csvPath.c_str(), "w");
+        if (f) {
+            fprintf(f, "layer,output,ms\n");
+            fprintf(f, "conv1 3x3 s1 p1,%dx%dx%d,%.3f\n", c1.h, c1.w, c1.c, tConv1);
+            fprintf(f, "relu1,-,%.3f\n", tRelu1);
+            fprintf(f, "maxpool 2x2,%dx%d,%.3f\n", p1.h, p1.w, tPool1);
+            fprintf(f, "conv2 3x3 s1 p1,%dx%dx%d,%.3f\n", c2.h, c2.w, c2.c, tConv2);
+            fprintf(f, "relu2,-,%.3f\n", tRelu2);
+            fprintf(f, "maxpool 2x2,%dx%d,%.3f\n", p2.h, p2.w, tPool2);
+            fprintf(f, "global avgpool,%d,%.3f\n", g.c, tGap);
+            fprintf(f, "fc,%d,%.3f\n", out.c, tFc);
+            fprintf(f, "total,,%.3f\n", totalBase);
+            fprintf(f, "fused_total,,%.3f\n", totalFused);
+            fclose(f);
+            printf("\n已写出逐层耗时 CSV：%s\n", csvPath.c_str());
+        }
+    }
 
     if (doDump) {
         dump("dump_input.bin", input, {N, IN, IN, IC});
