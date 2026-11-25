@@ -36,14 +36,33 @@ int main(int argc, char** argv) {
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         if (a == "dump") doDump = true;
-        else if (a == "--bench" && i + 1 < argc) benchN = std::max(1, atoi(argv[++i]));
-        else if (a == "--csv" && i + 1 < argc) csvPath = argv[++i];
+        else if (a == "--bench") {
+            // atoi 会把 "--bench abc" / "--bench 0" / "--bench -5" 都变成 1 次，
+            // 跑一次出来的最优值噪声极大却照样打印"优化了 x%"，这里直接拒掉
+            const char* s = (i + 1 < argc) ? argv[++i] : nullptr;
+            char* end = nullptr;
+            long v = s ? std::strtol(s, &end, 10) : 0;
+            if (!s || end == s || *end != '\0' || v < 3 || v > 100000) {
+                fprintf(stderr, "error: --bench 需要 3..100000 的整数（当前 \"%s\"）\n", s ? s : "");
+                return 2;
+            }
+            benchN = (int)v;
+        }
+        else if (a == "--csv") {
+            if (i + 1 >= argc) { fprintf(stderr, "error: --csv 缺少文件路径\n"); return 2; }
+            csvPath = argv[++i];
+        }
         else if (a == "--help" || a == "-h") {
             printf("用法: micro_infer [dump] [--bench N]\n");
             printf("  dump      导出 dump_*.bin 供 python 参考实现对拍\n");
-            printf("  --bench N 基准重复次数（默认 10），报告 min/中位/均值/max\n");
+            printf("  --bench N 基准重复次数（3..100000，默认 10），报告 min/中位/均值/max\n");
             printf("  --csv F   把逐层耗时写成 CSV，便于两次运行 diff 出性能回归\n");
+            printf("退码: 0 正常；1 优化前后输出不一致（max abs diff > 1e-4）；2 参数错\n");
             return 0;
+        }
+        else {
+            fprintf(stderr, "error: 未知选项 \"%s\"（--help 看用法）\n", a.c_str());
+            return 2;
         }
     }
     srand(42);  // 固定种子，保证 C++ 和 python 参考实现拿到同一组权重
@@ -223,6 +242,12 @@ int main(int argc, char** argv) {
         dump("dump_b3.bin", b3, {CLS});
         dump("dump_out.bin", out, {N, CLS});
         printf("\n已导出张量到 dump_*.bin，供 python 参考实现对拍\n");
+    }
+    // 融合实现算错时以前也只打印一行"不一致"然后退 0，CI 里看不出来。
+    // 现在把它变成可门禁的退码：max abs diff 超阈值就以 1 退出。
+    if (maxDiff > 1e-4f) {
+        fprintf(stderr, "error: 优化前后输出不一致（max abs diff = %.3e），融合实现有问题\n", maxDiff);
+        return 1;
     }
     return 0;
 }
